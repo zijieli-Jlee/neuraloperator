@@ -131,7 +131,6 @@ def load_darcy_pt(
         y_train = output_encoder.encode(y_train)
     else:
         output_encoder = None
-
     train_db = TensorDataset(
         x_train,
         y_train,
