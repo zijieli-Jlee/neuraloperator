@@ -2,11 +2,6 @@ import torch
 from torch import nn
 import math
 from torch.nn.init import xavier_uniform_, zeros_
-import torch.nn.functional as F
-from einops import rearrange, repeat
-
-from .mlp import MLPLinear
-from .embeddings import RotaryEmbedding, apply_rotary_pos_emb, apply_2d_rotary_pos_emb
 
 
 class AttentionKernelIntegral(torch.nn.Module):
@@ -20,7 +15,7 @@ class AttentionKernelIntegral(torch.nn.Module):
                  dim_head,
                  pos_dim,
                  use_pe=True,    # use positional encoding
-                 project_query=True
+                 project_query=True,
                  ):
         super().__init__()
         self.layers = nn.ModuleList([])
@@ -44,9 +39,6 @@ class AttentionKernelIntegral(torch.nn.Module):
 
         self.use_pe = use_pe
         self.pos_dim = pos_dim
-
-        if use_pe:
-            self.pos_emb = RotaryEmbedding(dim_head // self.pos_dim, min_freq=1 / 64)
 
         self.init_gain = 1 / math.sqrt(dim_head)
         self.diagonal_weight = self.init_gain
@@ -74,17 +66,18 @@ class AttentionKernelIntegral(torch.nn.Module):
 
     def normalize_wrt_domain(self, x, norm_fn):
         b = x.shape[0]
-        return rearrange(
-            norm_fn(rearrange(x, 'b h n d -> (b h) n d')),
-            '(b h) n d -> b h n d', b=b)
+        x = x.view(b*self.heads, -1, self.dim_head)
+        x = norm_fn(x)
+        return x.view(b, self.heads, -1, self.dim_head)
 
     def forward(self,
                 u_x,
                 pos_x,
+                pos_emb=None,    # positional encoding module for encoding q/k
                 u_y=None,
                 pos_y=None,
                 weights=None,
-                associate=True,   # can be faster if n is larger than the channel number c
+                associate=True,   # can be much faster if n is larger than the channel number c
                 get_kernel=False):
         """
         Computes kernel integral transform with attention
@@ -111,58 +104,60 @@ class AttentionKernelIntegral(torch.nn.Module):
         if get_kernel and associate:
             raise Exception('Cannot get attention when associate is True')
 
-        n = u_y.shape[1]
+        if self.use_pe and pos_emb is None:
+            raise Warning('pos_emb is not provided, but use_pe is True')
+
+        b, n = u_y.shape[:2]
 
         q = self.to_q(u_x)
         k = self.to_k(u_y)
         v = self.to_v(u_y)
-
-        q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)
-        k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)
-        v = rearrange(v, 'b n (h d) -> b h n d', h=self.heads)
+        q = q.view(b, -1, self.heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
+        k = k.view(b, -1, self.heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
+        v = v.view(b, -1, self.heads, self.dim_head).permute(0, 2, 1, 3).contiguous()
 
         if weights is None:
-            weights = torch.ones((u_y.shape[0], 1, u_y.shape[1], 1), device=u_y.device) / n
+            weights = torch.ones((u_y.shape[0], 1, u_y.shape[1], 1), device=u_y.device) / n   # uniform weights
         else:
-            weights = rearrange(weights, 'b n -> b () n ()')
+            weights = weights.view(b, 1, n, 1)
 
         # q = self.q_norm(q)
         k = self.normalize_wrt_domain(k, self.k_norm)
         v = self.normalize_wrt_domain(v, self.v_norm)
 
-        if self.use_pe:
+        if pos_emb is not None:
             if self.pos_dim == 2:
                 assert pos_x.shape[-1] == 2
-                q_freqs_x = self.pos_emb.forward(pos_x[..., 0], q.device)
-                q_freqs_y = self.pos_emb.forward(pos_x[..., 1], q.device)
-                q_freqs_x = repeat(q_freqs_x, '1 n d -> b h n d', b=q.shape[0], h=q.shape[1])
-                q_freqs_y = repeat(q_freqs_y, '1 n d -> b h n d', b=q.shape[0], h=q.shape[1])
+                q_freqs_x = pos_emb.forward(pos_x[..., 0], q.device)
+                q_freqs_y = pos_emb.forward(pos_x[..., 1], q.device)
+                q_freqs_x = q_freqs_x.unsqueeze(1).repeat([1, self.heads, 1, 1])
+                q_freqs_y = q_freqs_y.unsqueeze(1).repeat([1, self.heads, 1, 1])
 
                 if pos_y is None:
                     k_freqs_x = q_freqs_x
                     k_freqs_y = q_freqs_y
                 else:
-                    k_freqs_x = self.pos_emb.forward(pos_y[..., 0], k.device)
-                    k_freqs_y = self.pos_emb.forward(pos_y[..., 1], k.device)
-                    k_freqs_x = repeat(k_freqs_x, '1 n d -> b h n d', b=q.shape[0], h=k.shape[1])
-                    k_freqs_y = repeat(k_freqs_y, '1 n d -> b h n d', b=q.shape[0], h=k.shape[1])
+                    k_freqs_x = pos_emb.forward(pos_y[..., 0], k.device)
+                    k_freqs_y = pos_emb.forward(pos_y[..., 1], k.device)
+                    k_freqs_x = k_freqs_x.unsqueeze(1).repeat([1, self.heads, 1, 1])
+                    k_freqs_y = k_freqs_y.unsqueeze(1).repeat([1, self.heads, 1, 1])
 
-                q = apply_2d_rotary_pos_emb(q, q_freqs_x, q_freqs_y)
-                k = apply_2d_rotary_pos_emb(k, k_freqs_x, k_freqs_y)
+                q = pos_emb.apply_2d_rotary_pos_emb(q, q_freqs_x, q_freqs_y)
+                k = pos_emb.apply_2d_rotary_pos_emb(k, k_freqs_x, k_freqs_y)
             elif self.pos_dim == 1:
                 assert pos_x.shape[-1] == 1
 
-                q_freqs = self.pos_emb.forward(pos_x[..., 0], q.device).unsqueeze(0)
-                q_freqs = repeat(q_freqs, '1 n d -> b h n d', b=q.shape[0], h=q.shape[1])
+                q_freqs = pos_emb.forward(pos_x[..., 0], q.device)
+                q_freqs = q_freqs.unsqueeze(1).repeat([b, self.heads, 1, 1])
 
                 if pos_y is None:
                     k_freqs = q_freqs
                 else:
-                    k_freqs = self.pos_emb.forward(pos_y[..., 0], k.device).unsqueeze(0)
-                    k_freqs = repeat(k_freqs, '1 n d -> b h n d', b=q.shape[0], h=q.shape[1])
+                    k_freqs = pos_emb.forward(pos_y[..., 0], k.device)
+                    k_freqs = k_freqs.unsqueeze(1).repeat([b, self.heads, 1, 1])
 
-                q = apply_rotary_pos_emb(q, q_freqs)
-                k = apply_rotary_pos_emb(k, k_freqs)
+                q = pos_emb.apply_rotary_pos_emb(q, q_freqs)
+                k = pos_emb.apply_rotary_pos_emb(k, k_freqs)
             else:
                 raise Exception('Currently doesnt support relative embedding >= 3 dimensions')
 
@@ -174,7 +169,7 @@ class AttentionKernelIntegral(torch.nn.Module):
             kxy = torch.matmul(q, k.transpose(-1, -2))
             u = torch.matmul(kxy, v) * weights
 
-        u = rearrange(u, 'b h n d -> b n (h d)')
+        u = u.permute(0, 2, 1, 3).contiguous().view(b, n, self.heads*self.dim_head)
         u = self.to_out(u)
         if get_kernel:
             return u, kxy
